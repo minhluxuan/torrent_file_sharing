@@ -1,6 +1,6 @@
 {
     "0d307d79200c65891b90153ec70fac2be43b61c9": {
         "name": "file1.txt",
-        "piece_status": [0, 1, 0, 1, 1]
+        "piece_status": [1, 1, 0, 1, 1]
     }
 }

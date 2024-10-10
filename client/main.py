@@ -1,17 +1,20 @@
 import socket
 import threading
+
+from concurrent.futures import ThreadPoolExecutor
 from helper import main as helper
 import json
 import os
 import time
 from dotenv import load_dotenv
 import math
+from queue import Queue
 
 HOST = '127.0.0.1'
 PORT = 65431
 
 load_dotenv()
-PIECE_SIZE = os.getenv('PIECE_SIZE', '512')
+PIECE_SIZE = int(os.getenv('PIECE_SIZE', '512'))
 
 def start_peer_server(peer_ip='127.0.0.1', peer_port=65432):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -59,7 +62,6 @@ def handle_request(client_socket):
         elif request['type'] == 'GET_FILE_CHUNK':
             info_hash = request['info_hash']
             chunk_list = request['chunk_list']
-            chunk_size = 1
             chunk_data = []
 
             response = {
@@ -79,8 +81,8 @@ def handle_request(client_socket):
             try:
                 with open(file_name, "rb") as f:
                     for chunk_index in chunk_list:
-                        f.seek(chunk_index * chunk_size)
-                        data = f.read(chunk_size)
+                        f.seek(chunk_index * PIECE_SIZE)
+                        data = f.read(PIECE_SIZE)
                         chunk_data.append(data.decode('latin1'))
             except FileNotFoundError:
                 print(f"File {file_name} does not exit.")
@@ -94,6 +96,7 @@ def handle_request(client_socket):
 def connect_to_peer_and_get_file_status(peer_ip, peer_port, info_hash):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            
             s.connect((peer_ip, peer_port))
             print(f"Connected to {peer_ip}:{peer_port}")
             
@@ -130,13 +133,12 @@ def connect_to_peer_and_download_file_chunk(peer_ip, peer_port, info_hash, chunk
         
         response_data = s.recv(4096)
         response = json.loads(response_data.decode('utf-8'))
-        chunk_size = 1
         if response['type'] == 'FILE_CHUNK' and response['info_hash'] == info_hash:
             chunk_data = response['chunk_data']
             
             with open(file_path, "r+b") as f:  
                 for i, chunk in enumerate(chunk_data):
-                    f.seek(chunk_list[i] * chunk_size)
+                    f.seek(chunk_list[i] * PIECE_SIZE)
                     f.write(chunk.encode('latin1'))
                     print(f"Chunk {chunk_list[i]} has been written into file")
         else:
@@ -144,22 +146,24 @@ def connect_to_peer_and_download_file_chunk(peer_ip, peer_port, info_hash, chunk
 
 def download(info_hash):
     response = helper.get_file_by_info_hash('http://localhost:3000', info_hash)
-    if (response.status_code != 200):
+    if response.status_code != 200:
         print(f"Error: {response.json()['message'] if response.json() else 'An error occurs on tracker side'}")
         return
 
     if not response.json():
         print('No data were sent from server')
+        return
 
     if not response.json()['data'] or len(response.json()['data']) == 0 or len(response.json()['data'][0]['peers']) == 0:
         print('No peer keeps this file')
+        return
 
     file_name = response.json()['data'][0]['name']
     file_size = response.json()['data'][0]['size']
     server_url = response.json()['data'][0]['trackerUrl']
     file_path = f"storage/{file_name}"
 
-    num_of_pieces = math.ceil(file_size/int(PIECE_SIZE))
+    num_of_pieces = math.ceil(file_size / int(PIECE_SIZE))
 
     if not os.path.exists(file_path):
         with open(file_path, "wb") as f:
@@ -169,53 +173,113 @@ def download(info_hash):
     peers_file_status = {}
     chunk_count = {}
 
-    for p in peers_keep_file:
-        peer_ip, peer_port, pieces_status = connect_to_peer_and_get_file_status(p['address'], p['port'], info_hash)
-        if peer_ip and peer_port and pieces_status and len(pieces_status) > 0:
-            if len(pieces_status) != num_of_pieces:
-                continue
+    piece_status_lock = threading.Lock()
+    chunk_count_lock = threading.Lock()
+    piece_download_lock = threading.Lock()
+    file_status_lock = threading.Lock()
 
-            peers_file_status[(peer_ip, peer_port)] = pieces_status
+    connection_queue = Queue()
 
-            for chunk_index, has_chunk in enumerate(pieces_status):
-                    if has_chunk:
-                        if chunk_index not in chunk_count:
-                            chunk_count[chunk_index] = 0
-                        chunk_count[chunk_index] += 1
-    
-    rarest_chunks = sorted(chunk_count.items(), key=lambda x: x[1])
+    for peer in peers_keep_file:
+        if peer['address'] != HOST or peer['port'] != PORT:
+            connection_queue.put((peer['address'], peer['port']))
+
+    def get_file_status():
+        while not connection_queue.empty():
+            ip, port = connection_queue.get()
+            try:
+                peer_ip, peer_port, pieces_status = connect_to_peer_and_get_file_status(ip, port, info_hash)
+                if peer_ip and peer_port and pieces_status and len(pieces_status) > 0:
+                    if len(pieces_status) != num_of_pieces:
+                        continue
+                    
+                    with piece_status_lock:
+                        peers_file_status[(peer_ip, peer_port)] = pieces_status
+
+                    with chunk_count_lock:
+                        for chunk_index, has_chunk in enumerate(pieces_status):
+                            if has_chunk:
+                                if chunk_index not in chunk_count:
+                                    chunk_count[chunk_index] = 0
+                                chunk_count[chunk_index] += 1
+            except:
+                print(f"Error connecting to {ip}:{port}")
+            connection_queue.task_done()
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for _ in range(5):
+            executor.submit(get_file_status)
+
+    connection_queue.join()
+
+    chunk_peers_map = {}
+    for chunk_index in range(num_of_pieces):
+        peers_with_chunk = [(peer, sum(status)) for peer, status in peers_file_status.items() if status[chunk_index]]
+        if len(peers_with_chunk) > 0:
+            chunk_peers_map[chunk_index] = sorted(
+                peers_with_chunk,
+                key=lambda x: x[1]
+            )
+
+    chunk_queue = Queue()
+    for chunk_index in chunk_peers_map.keys():
+        chunk_queue.put(chunk_index)
 
     piece_has_been_downloaded = [0 for _ in range(num_of_pieces)]
-    for chunk_index, _ in rarest_chunks:
-        for (ip, port), value in peers_file_status.items():
-            if piece_has_been_downloaded[chunk_index] == 1:
-                continue
 
-            if value[chunk_index] == True:
-                connect_to_peer_and_download_file_chunk(ip, port, info_hash, [chunk_index], file_path)
-                piece_has_been_downloaded[chunk_index] = 1
+    def download_chunk():
+        while not chunk_queue.empty():
+            chunk_index = chunk_queue.get()
+            peers = chunk_peers_map.get(chunk_index, [])
 
-    try:
-        with open('file_status.json', 'r') as f:
-            file_status_data = json.load(f)
-            if not file_status_data[info_hash]:
-                file_status_data[info_hash] = {
-                    'name': file_name,
-                    'piece_status': piece_has_been_downloaded
-                }
-            else:
-                file_status_data[info_hash]['piece_status'] = piece_has_been_downloaded
-        
-        with open('file_status.json', 'w') as json_file:
-            json.dump(file_status_data, json_file, indent=4)
-    except FileNotFoundError:
-        print('File file_status.json does not exist')
+            for (ip, port), _ in peers:
+                with piece_download_lock:
+                    if piece_has_been_downloaded[chunk_index] == 1:
+                        continue
+                
+                try:
+                    connect_to_peer_and_download_file_chunk(ip, port, info_hash, [chunk_index], file_path)
+
+                    with piece_download_lock:
+                        piece_has_been_downloaded[chunk_index] = 1
+                    break
+                except Exception as e:
+                    print(f"Error downloading chunk {chunk_index} from {ip}:{port}: {e}")
+
+            chunk_queue.task_done()
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for _ in range(5):
+            executor.submit(download_chunk)
+
+    chunk_queue.join()
+
+    def update_file_status():
+        with file_status_lock:
+            try:
+                with open('file_status.json', 'r') as f:
+                    file_status_data = json.load(f)
+                    if not file_status_data.get(info_hash):
+                        file_status_data[info_hash] = {
+                            'name': file_name,
+                            'piece_status': piece_has_been_downloaded
+                        }
+                    else:
+                        file_status_data[info_hash]['piece_status'] = piece_has_been_downloaded
+
+                with open('file_status.json', 'w') as json_file:
+                    json.dump(file_status_data, json_file, indent=4)
+            except FileNotFoundError:
+                print('File file_status.json does not exist')
+
+    update_file_status()
 
     response = helper.announce_downloaded(server_url, info_hash, file_name, file_size, HOST, PORT)
     if response.status_code != 201:
         print('Download successfully, announce server failed')
     else:
         print('Download and announce server successfully')
+
 
 def fetch_file_from_server(server_url):
     response = helper.get_all_files(server_url)
