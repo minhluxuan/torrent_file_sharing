@@ -9,6 +9,7 @@ import time
 from dotenv import load_dotenv
 import math
 from queue import Queue
+import random
 
 HOST = '127.0.0.1'
 PORT = 65431
@@ -216,10 +217,18 @@ def download(info_hash):
     for chunk_index in range(num_of_pieces):
         peers_with_chunk = [(peer, sum(status)) for peer, status in peers_file_status.items() if status[chunk_index]]
         if len(peers_with_chunk) > 0:
-            chunk_peers_map[chunk_index] = sorted(
-                peers_with_chunk,
-                key=lambda x: x[1]
-            )
+            # chunk_peers_map[chunk_index] = sorted(
+            #     peers_with_chunk,
+            #     key=lambda x: x[1]
+            # )
+            chunk_peers_map[chunk_index] = peers_with_chunk
+            random.shuffle(chunk_peers_map[chunk_index])
+
+    # chunk_peers_map = {
+    # '0': [(127.0.0.1, 65432, 2), (127.0.0.1, 65433, 3)]
+    # '1': [(127.0.0.1, 65432, 2), (127.0.0.1, 65434, 4)]
+    # '2': [(127.0.0.1, 65433, 3), (127.0.0.1, 65435, 5)]
+    #}
 
     chunk_queue = Queue()
     for chunk_index in chunk_peers_map.keys():
@@ -286,6 +295,28 @@ def fetch_file_from_server(server_url):
     if response and response.status_code == 200 and response.json() and response.json()['data']:
         print(response.json()['data'])
         
+def upload_file_to_server(file_path):
+    if not os.path.exists(file_path):
+        print(f'Path {file_path} does not exist')
+        return
+
+    if not os.path.isfile(file_path):
+        print(f'{file_path} is not a file')
+        return
+    
+    info_hash = helper.generate_hash_info(file_path)
+    response = helper.upload_file(info_hash, os.path.basename(file_path), HOST, PORT)
+
+    if response == None:
+        print('Server is not working now')
+        return
+
+    if response.status_code != 201:
+        print(f"Upload failed: {response.json()['message']}")
+        return
+
+    print('Upload successfully')
+    return
 
 def process_input(cmd):
     params = cmd.split()
@@ -301,6 +332,12 @@ def process_input(cmd):
             if not params[1]:
                 print('Argument server url is required')
             fetch_file_from_server(params[1])
+        elif params[0] == 'upload':
+            if not params[1]:
+                print('Argument file path is required')
+            upload_file_to_server(params[1])
+        else:
+            print('Invalid command')
     except IndexError as e:
         print('Invalid command')
 
