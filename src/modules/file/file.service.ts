@@ -1,5 +1,5 @@
 import { BadRequestException, Inject, Injectable, NotFoundException } from "@nestjs/common";
-import { FILE_REPOSITORY, PEER_ON_FILE_REPOSITORY, PEER_REPOSITORY } from "src/common/constants";
+import { FILE_REPOSITORY, PEER_ON_FILE_REPOSITORY, PEER_REPOSITORY, PeerRole } from "src/common/constants";
 import { File } from './file.entity';
 import { UploadFileDto } from "./dtos/upload_file.dto";
 import { PeerService } from "../peer/peer.service";
@@ -9,6 +9,7 @@ import { PeerOnFile } from "../peer/peer_on_file.entity";
 import { UUID } from "crypto";
 import { UserService } from "../user/services/user.service";
 import { User } from "../user/entities/user.entity";
+import { AnnounceDto } from "./dtos/create_peer_on_file.dto";
 
 @Injectable()
 export class FileService {
@@ -86,9 +87,49 @@ export class FileService {
             });
         }
 
-        await this.peerOnFileService.create(existedFile.id, existedPeer.id);
+        await this.peerOnFileService.create(existedFile.id, existedPeer.id, PeerRole.SEEDER);
 
         return existedFile;
+    }
+
+    async announce(dto: AnnounceDto) {
+        let existedFile = await this.fileRepository.findOne({
+            where: {
+                infoHash: dto.infoHash
+            }
+        });
+
+        if (!existedFile) {
+            throw new NotFoundException('File không tồn tại')
+        }
+
+        if (dto.status === 'start') {
+            let existedPeer = await this.peerService.findByAddressAndPort(dto.peerAddress, dto.peerPort);
+
+            if (!existedPeer) {
+                existedPeer = await this.peerService.create({
+                    address: dto.peerAddress,
+                    port: dto.peerPort
+                });
+            }
+
+            return await this.peerOnFileService.update(existedPeer.id, existedFile.id, PeerRole.LEECHER);
+        }
+
+        if (dto.status === 'completed') {
+            let existedPeer = await this.peerService.findByAddressAndPort(dto.peerAddress, dto.peerPort);
+
+            if (!existedPeer) {
+                existedPeer = await this.peerService.create({
+                    address: dto.peerAddress,
+                    port: dto.peerPort
+                });
+            }
+
+            return await this.peerOnFileService.update(existedPeer.id, existedFile.id, PeerRole.SEEDER);
+        }
+
+        return null;
     }
 
     async createPOFByInfoHashAndPeerAddress(infoHash: string, fileName: string, fileSize: number, peerAddress: string, peerPort: number) {
@@ -126,9 +167,88 @@ export class FileService {
                 peerId: existedPeer.id
             }
         })) {
-            return await this.peerOnFileService.create(existedFile.id, existedPeer.id);
+            return await this.peerOnFileService.create(existedFile.id, existedPeer.id, PeerRole.SEEDER);
         }
 
         throw new BadRequestException('Announcing failed since your upload has been recorded before');
+    }
+
+    async scrape(infoHash: string) {
+        const existedFile = await this.fileRepository.findOne({
+            where: {
+                infoHash
+            }
+        });
+
+        if (!existedFile) {
+            throw new NotFoundException('File không tồn tại');
+        }
+
+        const peersOnFile = await this.peerOnFileRepository.findAll({
+            where: {
+                fileId: existedFile.id,
+            },
+            attributes: ['role'],
+            include: [
+                { model: Peer, attributes: ['address', 'port'] }
+            ]
+        });
+        
+        return peersOnFile.map(pof => { return { role: pof.role , address: pof.peer.address, port: pof.peer.port } });
+    }
+
+    async getSeeders(infoHash: string) {
+        const existedFile = await this.fileRepository.findOne({
+            where: {
+                infoHash
+            }
+        });
+
+        if (!existedFile) {
+            throw new NotFoundException('File không tồn tại');
+        }
+
+        const seedersOnFile = await this.peerOnFileRepository.findAll({
+            where: {
+                fileId: existedFile.id,
+                role: PeerRole.SEEDER
+            },
+            attributes: [],
+            include: [
+                { model: Peer, attributes: ['address', 'port'] }
+            ]
+        });
+        
+        return seedersOnFile.map(sof => sof.peer);
+    }
+
+    async unlink(address: string, port: number, infoHash: string) {
+        const existedPeer = await this.peerRepository.findOne({
+            where: {
+                address,
+                port
+            }
+        });
+
+        if (!existedPeer) {
+            throw new NotFoundException('Peer không tồn tại');
+        }
+
+        const existedFile = await this.fileRepository.findOne({
+            where: {
+                infoHash
+            }
+        });
+
+        if (!existedFile) {
+            throw new NotFoundException('File không tồn tại');
+        }
+
+        await this.peerOnFileRepository.destroy({
+            where: {
+                peerId: existedPeer.id,
+                fileId: existedFile.id
+            }
+        });
     }
 }

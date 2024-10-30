@@ -1,7 +1,6 @@
-export class CreatePeerOnFileDto {
+export class AnnounceDto {
     infoHash: string;
-    fileName: string;
-    fileSize: number;
     peerAddress: string;
     peerPort: number;
+    status: 'start' | 'stop' | 'completed'
 }

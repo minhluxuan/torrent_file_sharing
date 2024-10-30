@@ -1,6 +1,6 @@
 import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { PeerOnFile } from "./peer_on_file.entity";
-import { PEER_ON_FILE_REPOSITORY, PEER_REPOSITORY } from "src/common/constants";
+import { PEER_ON_FILE_REPOSITORY, PEER_REPOSITORY, PeerRole } from "src/common/constants";
 import { UUID } from "crypto";
 import { Peer } from "./peer.entity";
 import { PeerService } from "./peer.service";
@@ -13,11 +13,12 @@ export class PeerOnFileService {
         private readonly peerService: PeerService
     ) {}
 
-    async create(fileId: UUID, peerId: UUID) {
+    async create(fileId: UUID, peerId: UUID, role: PeerRole) {
         const existedPair = await this.peerOnFileRepository.findAll({
             where: {
                 fileId,
-                peerId
+                peerId,
+                role
             }
         });
 
@@ -29,5 +30,11 @@ export class PeerOnFileService {
             fileId,
             peerId
         });
+    }
+
+    async update(peerId: UUID, fileId: UUID, role: PeerRole) {
+        return await this.peerOnFileRepository.update({
+            role
+        }, { where: { peerId, fileId }})
     }
 }
